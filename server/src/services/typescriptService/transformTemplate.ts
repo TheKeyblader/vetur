@@ -175,10 +175,21 @@ export function getTemplateTransformFunctions(
   }
 
   function transformNativeAttribute(attr: AST.VAttribute): ts.ObjectLiteralElementLike {
-    return tsModule.createPropertyAssignment(
-      tsModule.createStringLiteral(attr.key.name),
-      attr.value ? tsModule.createLiteral(attr.value.value) : tsModule.createLiteral(true)
-    );
+    // Give the property name a source map range pointing at the attribute name so a type
+    // error on a static attribute (e.g. `color="tertiary"`) can be mapped back to the
+    // template, just like a bound `:color="..."`. Without a range the diagnostic falls
+    // outside every source-map region and gets silently dropped.
+    const propNameNode = tsModule.setSourceMapRange(tsModule.createStringLiteral(attr.key.name), {
+      pos: attr.key.range[0],
+      end: attr.key.range[1]
+    });
+    const valueNode = attr.value
+      ? tsModule.setSourceMapRange(tsModule.createLiteral(attr.value.value), {
+          pos: attr.value.range[0],
+          end: attr.value.range[1]
+        })
+      : tsModule.createLiteral(true);
+    return tsModule.createPropertyAssignment(propNameNode, valueNode);
   }
 
   function transformVBind(vBind: AST.VDirective, code: string, scope: string[]): ts.ObjectLiteralElementLike {

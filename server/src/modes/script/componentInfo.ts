@@ -157,7 +157,9 @@ function getDecorators(
   tsModule: RuntimeLibrary['typescript'],
   node: ts.MethodDeclaration | ts.PropertyDeclaration | undefined
 ) {
-  if (!node) return undefined;
+  if (!node) {
+    return undefined;
+  }
   return tsModule.getDecorators?.(node) ?? node.decorators;
 }
 
@@ -215,9 +217,6 @@ function getEmits(
             emitDecoratorNames.includes(decoratorName)
           )
       );
-    if (emitsSymbols.length === 0) {
-      return undefined;
-    }
 
     // There maybe same emit name because @Emit can be put on multiple methods.
     const emitInfoMap = new Map<string, EmitInfo>();
@@ -269,14 +268,82 @@ function getEmits(
       }
     });
 
-    const emitInfo = [...emitInfoMap.values()];
-    emitInfo.forEach(info => {
+    emitInfoMap.forEach(info => {
       if (info.typeString) {
         info.typeString = `(arg: ${info.typeString}) => any`;
       }
     });
 
-    return emitInfo;
+    // `@PropSync` / `@ModelSync` / `@VModel` declare an implicit update event in addition to
+    // their prop, so the parent can listen to it (`@update:name` / `@change` / `@input`) with
+    // a typed handler. Method `@Emit` of the same name (unlikely) takes precedence.
+    getClassPropEventEmits(type).forEach(info => {
+      if (!emitInfoMap.has(info.name)) {
+        emitInfoMap.set(info.name, info);
+      }
+    });
+
+    return emitInfoMap.size === 0 ? undefined : [...emitInfoMap.values()];
+  }
+
+  /**
+   * Collect the implicit events emitted by property decorators:
+   *  - `@VModel(options)`                       -> `input`
+   *  - `@ModelSync('prop', 'event', options)`   -> `event`
+   *  - `@PropSync('prop', options)`             -> `update:prop`
+   * The event payload type is the property's annotated type when it can be expressed
+   * self-contained (otherwise the emit stays untyped but still completable).
+   */
+  function getClassPropEventEmits(type: ts.Type): EmitInfo[] {
+    const eventEmitDecoratorNames = ['VModel', 'ModelSync', 'PropSync'];
+    const symbols = type
+      .getProperties()
+      .filter(
+        property =>
+          validPropertySyntaxKind(property, tsModule.SyntaxKind.PropertyDeclaration) &&
+          getPropertyDecoratorNames(tsModule, property).some(decoratorName =>
+            eventEmitDecoratorNames.includes(decoratorName)
+          )
+      );
+
+    const result: EmitInfo[] = [];
+    symbols.forEach(propSymbol => {
+      const prop = propSymbol.valueDeclaration as ts.PropertyDeclaration;
+      const decoratorExpr = getDecorators(tsModule, prop)?.find(decorator =>
+        tsModule.isCallExpression(decorator.expression)
+          ? eventEmitDecoratorNames.includes(decorator.expression.expression.getText())
+          : false
+      )?.expression as ts.CallExpression | undefined;
+      if (!decoratorExpr) {
+        return;
+      }
+      const decoratorName = decoratorExpr.expression.getText();
+      const [firstNode, secondNode] = decoratorExpr.arguments;
+
+      let eventName: string | undefined;
+      if (decoratorName === 'VModel') {
+        eventName = 'input';
+      } else if (decoratorName === 'ModelSync' && tsModule.isStringLiteral(secondNode)) {
+        eventName = secondNode.text;
+      } else if (decoratorName === 'PropSync' && tsModule.isStringLiteral(firstNode)) {
+        eventName = `update:${firstNode.text}`;
+      }
+      if (!eventName) {
+        return;
+      }
+
+      const propType = checker.getTypeOfSymbolAtLocation(propSymbol, prop);
+      const valueTypeString = getSelfContainedTypeString(tsModule, propType, prop, checker);
+
+      result.push({
+        name: eventName,
+        hasValidator: false,
+        typeString: valueTypeString ? `(arg: ${valueTypeString}) => any` : undefined,
+        documentation: buildDocumentation(tsModule, propSymbol, checker)
+      });
+    });
+
+    return result;
   }
 
   function getObjectEmits(type: ts.Type) {
@@ -491,7 +558,13 @@ function getProps(
   }
 
   function getClassProps(type: ts.Type) {
-    const propDecoratorNames = ['Prop', 'Model', 'PropSync'];
+    // `vue-property-decorator` decorators that declare a prop on the component:
+    //  - `@Prop(options)`                              -> prop named after the property
+    //  - `@Model('event', options)`                    -> prop named after the property, v-model bound
+    //  - `@PropSync('name', options)`                  -> prop named `name` (property is the `.sync` proxy)
+    //  - `@ModelSync('name', 'event', options)`        -> prop named `name`, v-model bound
+    //  - `@VModel(options)`                            -> prop named `value`, v-model bound
+    const propDecoratorNames = ['Prop', 'Model', 'PropSync', 'ModelSync', 'VModel'];
     const propsSymbols = type
       .getProperties()
       .filter(
@@ -513,21 +586,57 @@ function getProps(
           : false
       )?.expression as ts.CallExpression;
       const decoratorName = decoratorExpr.expression.getText();
-      const [firstNode, secondNode] = decoratorExpr.arguments;
-      if (decoratorName === 'PropSync' && tsModule.isStringLiteral(firstNode)) {
+      const [firstNode, secondNode, thirdNode] = decoratorExpr.arguments;
+
+      // With `vue-property-decorator` the decorator only carries the *runtime* type
+      // (e.g. `@Prop(String)` / `@Prop({ type: String })`) while the real prop type is
+      // declared as a TypeScript annotation on the property itself
+      // (e.g. `@Prop() readonly color!: ColorToken`). Prefer that annotation so custom
+      // types (`type ColorToken = 'primary' | 'secondary'`) are preserved when the prop is
+      // type-checked in parent templates. Falls back to the decorator type when the
+      // property has no usable annotation.
+      const propType = checker.getTypeOfSymbolAtLocation(propSymbol, prop);
+      const annotatedTypeString = getSelfContainedTypeString(tsModule, propType, prop, checker);
+      const values = getStringLiteralValues(tsModule, propType, checker);
+      const documentation = buildDocumentation(tsModule, propSymbol, checker);
+
+      // `@PropSync('name', options)` / `@ModelSync('name', 'event', options)`: the declared
+      // prop is named by the first string argument (the property itself proxies it as a
+      // computed). `@ModelSync` additionally binds the prop to v-model.
+      if ((decoratorName === 'PropSync' || decoratorName === 'ModelSync') && tsModule.isStringLiteral(firstNode)) {
+        const validatorInfo = getPropValidatorInfo(decoratorName === 'ModelSync' ? thirdNode : secondNode);
         return {
           name: firstNode.text,
-          ...getPropValidatorInfo(secondNode),
-          isBoundToModel: false,
-          documentation: buildDocumentation(tsModule, propSymbol, checker)
+          ...validatorInfo,
+          typeString: annotatedTypeString ?? validatorInfo.typeString,
+          values,
+          isBoundToModel: decoratorName === 'ModelSync',
+          documentation
         };
       }
 
+      // `@VModel(options)` always declares the v-model prop named `value`.
+      if (decoratorName === 'VModel') {
+        const validatorInfo = getPropValidatorInfo(firstNode);
+        return {
+          name: 'value',
+          ...validatorInfo,
+          typeString: annotatedTypeString ?? validatorInfo.typeString,
+          values,
+          isBoundToModel: true,
+          documentation
+        };
+      }
+
+      // `@Prop(options)` / `@Model('event', options)`: the prop keeps the property's own name.
+      const validatorInfo = getPropValidatorInfo(decoratorName === 'Model' ? secondNode : firstNode);
       return {
         name: propSymbol.name,
-        ...getPropValidatorInfo(decoratorName === 'Model' ? secondNode : firstNode),
+        ...validatorInfo,
+        typeString: annotatedTypeString ?? validatorInfo.typeString,
+        values,
         isBoundToModel: decoratorName === 'Model',
-        documentation: buildDocumentation(tsModule, propSymbol, checker)
+        documentation
       };
     });
   }
@@ -619,7 +728,18 @@ function getData(
   return result.length === 0 ? undefined : result;
 
   function getClassData(type: ts.Type) {
-    const noDataDecoratorNames = ['Prop', 'Model', 'Provide', 'ProvideReactive', 'Ref'];
+    // `@PropSync` / `@ModelSync` / `@VModel` proxy properties are computed, not data; `@Inject`
+    // / `@InjectReactive` stay reactive members reachable from the template (treated as data).
+    const noDataDecoratorNames = [
+      'Prop',
+      'Model',
+      'PropSync',
+      'ModelSync',
+      'VModel',
+      'Provide',
+      'ProvideReactive',
+      'Ref'
+    ];
     const dataSymbols = type
       .getProperties()
       .filter(
@@ -685,11 +805,25 @@ function getComputed(
     const setAccessorSymbols = defaultExportType
       .getProperties()
       .filter(property => property.valueDeclaration?.kind === tsModule.SyntaxKind.SetAccessor);
-    if (getAccessorSymbols.length === 0) {
+
+    // `@PropSync` / `@ModelSync` / `@VModel` turn the decorated property into a computed proxy
+    // (get/set backed by the prop + emit), so expose it as a computed member of the component.
+    const computedDecoratorNames = ['PropSync', 'ModelSync', 'VModel'];
+    const decoratorComputedSymbols = type
+      .getProperties()
+      .filter(
+        property =>
+          validPropertySyntaxKind(property, tsModule.SyntaxKind.PropertyDeclaration) &&
+          getPropertyDecoratorNames(tsModule, property).some(decoratorName =>
+            computedDecoratorNames.includes(decoratorName)
+          )
+      );
+
+    if (getAccessorSymbols.length === 0 && decoratorComputedSymbols.length === 0) {
       return undefined;
     }
 
-    return getAccessorSymbols.map(computed => {
+    const accessorComputed = getAccessorSymbols.map(computed => {
       const setComputed = setAccessorSymbols.find(setAccessor => setAccessor.name === computed.name);
       return {
         name: computed.name,
@@ -698,6 +832,13 @@ function getComputed(
           (setComputed !== undefined ? buildDocumentation(tsModule, setComputed, checker) : '')
       };
     });
+
+    const decoratorComputed = decoratorComputedSymbols.map(computed => ({
+      name: computed.name,
+      documentation: buildDocumentation(tsModule, computed, checker)
+    }));
+
+    return [...accessorComputed, ...decoratorComputed];
   }
 
   function getObjectComputed(type: ts.Type) {
@@ -898,6 +1039,327 @@ function getPropertyDecoratorNames(tsModule: RuntimeLibrary['typescript'], prope
     .map(decorator => decorator.expression as ts.CallExpression)
     .filter(decoratorExpression => decoratorExpression.expression !== undefined)
     .map(decoratorExpression => decoratorExpression.expression.getText());
+}
+
+/**
+ * Global type names that resolve inside the generated virtual template file
+ * (`*.vue.template`). Local type aliases / interfaces declared in a component
+ * (e.g. `ColorToken`, `Foo`) are *not* in scope there, so a prop type string that
+ * references them would yield `Cannot find name` errors and must be rejected.
+ */
+const ALLOWED_GLOBAL_TYPE_IDENTIFIERS = new Set([
+  'string',
+  'number',
+  'boolean',
+  'any',
+  'unknown',
+  'never',
+  'void',
+  'undefined',
+  'null',
+  'object',
+  'symbol',
+  'bigint',
+  'true',
+  'false',
+  'Array',
+  'ReadonlyArray',
+  'Date',
+  'Function',
+  'Object',
+  'Promise',
+  'Record',
+  'Map',
+  'Set',
+  'WeakMap',
+  'WeakSet',
+  'RegExp',
+  'Error',
+  'Symbol',
+  'Partial',
+  'Required',
+  'Readonly',
+  'Pick',
+  'Omit',
+  'Exclude',
+  'Extract',
+  'NonNullable'
+]);
+
+/**
+ * A type string is "self-contained" when every bare identifier it references is a global
+ * type available in the virtual template file. String/number literals are ignored so a
+ * union such as `"primary" | "secondary"` passes, while `ColorToken` or `Foo` does not.
+ */
+function isSelfContainedTypeString(typeString: string): boolean {
+  const withoutStringLiterals = typeString
+    .replace(/'(?:[^'\\]|\\.)*'/g, '')
+    .replace(/"(?:[^"\\]|\\.)*"/g, '')
+    .replace(/`(?:[^`\\]|\\.)*`/g, '');
+  const identifiers = withoutStringLiterals.match(/[A-Za-z_$][A-Za-z0-9_$]*/g) ?? [];
+  return identifiers.every(id => ALLOWED_GLOBAL_TYPE_IDENTIFIERS.has(id));
+}
+
+/** Hard cap on an expanded structural type so a huge external interface falls back to `any`. */
+const MAX_SELF_CONTAINED_TYPE_LENGTH = 800;
+
+function getObjectFlags(tsModule: RuntimeLibrary['typescript'], type: ts.Type): ts.ObjectFlags {
+  return type.flags & tsModule.TypeFlags.Object ? (type as ts.ObjectType).objectFlags : 0;
+}
+
+function isArrayLikeTypeReference(tsModule: RuntimeLibrary['typescript'], type: ts.Type): type is ts.TypeReference {
+  return Boolean(
+    getObjectFlags(tsModule, type) & tsModule.ObjectFlags.Reference &&
+      type.symbol &&
+      (type.symbol.name === 'Array' || type.symbol.name === 'ReadonlyArray')
+  );
+}
+
+function isTupleTypeReference(tsModule: RuntimeLibrary['typescript'], type: ts.Type): type is ts.TypeReference {
+  return Boolean(
+    getObjectFlags(tsModule, type) & tsModule.ObjectFlags.Reference &&
+      (type as ts.TypeReference).target.objectFlags & tsModule.ObjectFlags.Tuple
+  );
+}
+
+function isValidIdentifier(name: string): boolean {
+  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name);
+}
+
+/**
+ * Return the list of string values when `type` is a string literal or a union of string
+ * literals (`'primary' | 'secondary'` -> `['primary', 'secondary']`), otherwise `undefined`.
+ * Used to offer static attribute value completions (`color="primary"`).
+ */
+export function getStringLiteralValues(
+  tsModule: RuntimeLibrary['typescript'],
+  type: ts.Type,
+  checker: ts.TypeChecker
+): string[] | undefined {
+  const nonNullableType = checker.getNonNullableType(type);
+  const members = nonNullableType.isUnion() ? nonNullableType.types : [nonNullableType];
+  const values: string[] = [];
+  for (const member of members) {
+    if (member.isStringLiteral()) {
+      values.push(member.value);
+    } else {
+      return undefined;
+    }
+  }
+  return values.length > 0 ? values : undefined;
+}
+
+/** Rebuild a single call signature as `(name: T, ...) => R`, expanding any custom types. */
+function getCallSignatureString(
+  tsModule: RuntimeLibrary['typescript'],
+  signature: ts.Signature,
+  enclosingDeclaration: ts.Node | undefined,
+  checker: ts.TypeChecker,
+  depth: number,
+  seen: Set<ts.Type>
+): string | undefined {
+  const params: string[] = [];
+  for (let i = 0; i < signature.parameters.length; i++) {
+    const parameter = signature.parameters[i];
+    const parameterDeclaration = parameter.valueDeclaration;
+    let parameterType = checker.getTypeOfSymbolAtLocation(parameter, parameterDeclaration ?? enclosingDeclaration!);
+    const isRest = Boolean(
+      parameterDeclaration && tsModule.isParameter(parameterDeclaration) && parameterDeclaration.dotDotDotToken
+    );
+    const isOptional = Boolean(
+      parameterDeclaration &&
+        tsModule.isParameter(parameterDeclaration) &&
+        (parameterDeclaration.questionToken || parameterDeclaration.initializer)
+    );
+    if (isOptional && !isRest) {
+      parameterType = checker.getNonNullableType(parameterType);
+    }
+    const serialized = getSelfContainedTypeString(
+      tsModule,
+      parameterType,
+      enclosingDeclaration,
+      checker,
+      depth + 1,
+      seen
+    );
+    if (serialized === undefined) {
+      return undefined;
+    }
+    const name = isValidIdentifier(parameter.name) ? parameter.name : `arg${i}`;
+    params.push(`${isRest ? '...' : ''}${name}${isOptional && !isRest ? '?' : ''}: ${serialized}`);
+  }
+
+  const returnType = getSelfContainedTypeString(
+    tsModule,
+    signature.getReturnType(),
+    enclosingDeclaration,
+    checker,
+    depth + 1,
+    seen
+  );
+  if (returnType === undefined) {
+    return undefined;
+  }
+
+  return `(${params.join(', ')}) => ${returnType}`;
+}
+
+/**
+ * Serialize a TypeScript type into a *self-contained* type string usable in the generated
+ * virtual template file, so custom types declared in a child component are still type-checked
+ * when the prop is used in a parent template. Handles:
+ *  - type aliases / literal unions (`ColorToken` -> `"primary" | "secondary"`),
+ *  - arrays and tuples (`ColorToken[]` -> `("primary" | "secondary")[]`),
+ *  - unions & intersections,
+ *  - callbacks (`(v: ColorToken) => void`),
+ *  - interfaces / object types, expanded structurally (`Badge` -> `{ id: number; ... }`).
+ *
+ * Returns `undefined` when the type cannot be expressed without referencing a local name
+ * (recursive types, enums, exotic/huge types, ...), so callers can safely fall back to a
+ * looser type rather than emitting an unresolvable identifier.
+ */
+export function getSelfContainedTypeString(
+  tsModule: RuntimeLibrary['typescript'],
+  type: ts.Type,
+  enclosingDeclaration: ts.Node | undefined,
+  checker: ts.TypeChecker,
+  depth = 0,
+  seen: Set<ts.Type> = new Set()
+): string | undefined {
+  if (depth > 6) {
+    return undefined;
+  }
+
+  // Only the top-level prop's "not required" state is modeled separately (via `?`), so drop
+  // null/undefined there to keep the value type clean (`color?: ColorToken` -> `ColorToken`).
+  const currentType = depth === 0 ? checker.getNonNullableType(type) : type;
+
+  // `ColorToken[]` -> `("primary" | "secondary")[]`
+  if (isArrayLikeTypeReference(tsModule, currentType)) {
+    const [element] = checker.getTypeArguments(currentType);
+    if (element) {
+      const serialized = getSelfContainedTypeString(tsModule, element, enclosingDeclaration, checker, depth + 1, seen);
+      if (serialized === undefined) {
+        return undefined;
+      }
+      return `${/[|&]/.test(serialized) ? `(${serialized})` : serialized}[]`;
+    }
+  }
+
+  // `[A, B]` -> serialize each element.
+  if (isTupleTypeReference(tsModule, currentType)) {
+    const elements = checker
+      .getTypeArguments(currentType)
+      .map(element => getSelfContainedTypeString(tsModule, element, enclosingDeclaration, checker, depth + 1, seen));
+    return elements.every((element): element is string => element !== undefined)
+      ? `[${elements.join(', ')}]`
+      : undefined;
+  }
+
+  // `InTypeAlias` expands a top-level alias while keeping primitives such as `boolean` intact
+  // (instead of `true | false`). Primitives, literal unions, well-known globals and already
+  // self-contained function types are taken verbatim; object literals (printed with `{ ... }`)
+  // are always rebuilt structurally below so their member types are checked too.
+  const typeString = checker.typeToString(
+    currentType,
+    enclosingDeclaration,
+    tsModule.TypeFormatFlags.InTypeAlias | tsModule.TypeFormatFlags.NoTruncation
+  );
+  if (typeString === 'any' || typeString === 'unknown' || typeString === 'never') {
+    return undefined;
+  }
+  if (!typeString.includes('{') && isSelfContainedTypeString(typeString)) {
+    return typeString;
+  }
+
+  // `ColorToken | number` / intersections: expand each member so resolvable parts survive.
+  if (currentType.isUnion()) {
+    const parts = currentType.types.map(member =>
+      getSelfContainedTypeString(tsModule, member, enclosingDeclaration, checker, depth + 1, seen)
+    );
+    return parts.every((part): part is string => part !== undefined) ? parts.join(' | ') : undefined;
+  }
+  if (currentType.isIntersection()) {
+    const parts = currentType.types.map(member =>
+      getSelfContainedTypeString(tsModule, member, enclosingDeclaration, checker, depth + 1, seen)
+    );
+    return parts.every((part): part is string => part !== undefined) ? parts.join(' & ') : undefined;
+  }
+
+  const callSignatures = checker.getSignaturesOfType(currentType, tsModule.SignatureKind.Call);
+  const constructSignatures = checker.getSignaturesOfType(currentType, tsModule.SignatureKind.Construct);
+  const properties = checker.getPropertiesOfType(currentType);
+
+  // A plain callback type (single call signature, no own properties).
+  if (callSignatures.length === 1 && constructSignatures.length === 0 && properties.length === 0) {
+    return getCallSignatureString(tsModule, callSignatures[0], enclosingDeclaration, checker, depth, seen);
+  }
+  // Overloaded / constructible / callable-with-members types: only keep if already resolvable.
+  if (callSignatures.length > 0 || constructSignatures.length > 0) {
+    return isSelfContainedTypeString(typeString) ? typeString : undefined;
+  }
+
+  // Interface / object type -> expand to a structural literal `{ key: T; ... }` so a named
+  // interface (`@Prop() foo!: Badge`) is type-checked in parent templates.
+  if (getObjectFlags(tsModule, currentType)) {
+    if (seen.has(currentType)) {
+      return undefined; // recursive type, cannot be inlined
+    }
+    seen.add(currentType);
+    try {
+      const members: string[] = [];
+
+      for (const property of properties) {
+        const declaration = property.valueDeclaration ?? property.declarations?.[0] ?? enclosingDeclaration;
+        let propertyType = checker.getTypeOfSymbolAtLocation(property, declaration ?? enclosingDeclaration!);
+        const optional = Boolean(property.flags & tsModule.SymbolFlags.Optional);
+        if (optional) {
+          propertyType = checker.getNonNullableType(propertyType);
+        }
+        const serialized = getSelfContainedTypeString(
+          tsModule,
+          propertyType,
+          enclosingDeclaration,
+          checker,
+          depth + 1,
+          seen
+        );
+        if (serialized === undefined) {
+          return undefined;
+        }
+        const key = isValidIdentifier(property.name) ? property.name : JSON.stringify(property.name);
+        members.push(`${key}${optional ? '?' : ''}: ${serialized}`);
+      }
+
+      for (const indexKind of [tsModule.IndexKind.String, tsModule.IndexKind.Number]) {
+        const indexInfo = checker.getIndexInfoOfType(currentType, indexKind);
+        if (indexInfo) {
+          const serialized = getSelfContainedTypeString(
+            tsModule,
+            indexInfo.type,
+            enclosingDeclaration,
+            checker,
+            depth + 1,
+            seen
+          );
+          if (serialized === undefined) {
+            return undefined;
+          }
+          members.push(`[key: ${indexKind === tsModule.IndexKind.String ? 'string' : 'number'}]: ${serialized}`);
+        }
+      }
+
+      if (members.length === 0) {
+        return undefined;
+      }
+      const result = `{ ${members.join('; ')} }`;
+      return result.length > MAX_SELF_CONTAINED_TYPE_LENGTH ? undefined : result;
+    } finally {
+      seen.delete(currentType);
+    }
+  }
+
+  return undefined;
 }
 
 export function buildDocumentation(tsModule: RuntimeLibrary['typescript'], s: ts.Symbol, checker: ts.TypeChecker) {

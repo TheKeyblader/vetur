@@ -87,6 +87,12 @@ export interface PropInfo {
   isBoundToModel: boolean;
   documentation?: string;
   typeString?: string;
+  /**
+   * Enumerable string values when the prop type is a string literal (union), e.g.
+   * `type ColorToken = 'primary' | 'secondary'` -> `['primary', 'secondary']`.
+   * Used to offer value completions on a static attribute (`color="primary"`).
+   */
+  values?: string[];
 }
 export interface DataInfo {
   name: string;

@@ -1,5 +1,17 @@
 # Changelog
 
+### 0.38.0 | 2026-06-22
+
+- Type-check `vue-property-decorator` props by their TypeScript annotation (e.g. `@Prop() readonly color!: ColorToken`) when used in parent templates, instead of only the decorator's runtime type. Custom types such as `type ColorToken = 'primary' | 'secondary'` are now expanded and validated (and offered as value completions) on the parent `<child :color="...">`.
+  - Named interfaces / object types (`@Prop() badge!: Badge`) are expanded structurally (`{ count: number; color: 'primary' | 'secondary'; ... }`), including arrays, tuples, unions, and callback signatures, so they are type-checked in parent templates too. Types that cannot be inlined (recursive types, enums, very large/exotic types) safely fall back to `any`.
+  - Static attributes (`color="tertiary"`, without `:`) on child components are now type-checked too — previously the diagnostic was silently dropped because the generated node carried no source map range.
+  - String-literal (union) prop types now offer their values as completions on the static attribute form (typing inside `color="…"` suggests `primary` / `secondary`).
+- Handle the remaining "model" `vue-property-decorator` decorators so the props and events they declare are type-checked and completed in parent templates:
+  - `@VModel(options)` declares the `value` prop (typed by the property annotation, v-model bound) and the `input` event.
+  - `@ModelSync('prop', 'event', options)` declares the `prop` prop (v-model bound) and the `event` event.
+  - `@PropSync('prop', options)` now also exposes its implicit `update:prop` event.
+  - The proxy properties of `@PropSync` / `@ModelSync` / `@VModel` are reported as computed members (not data); `@Inject` / `@InjectReactive` remain reachable from the template.
+
 ### 0.37.3 | 2023-02-23 | [VSIX](https://marketplace.visualstudio.com/_apis/public/gallery/publishers/octref/vsextensions/vetur/0.37.3/vspackage)
 - Ignore vue/multi-word-component-names in template validation. #3649
 - Fix vetur hang any request when project have .gitignore. #3657
